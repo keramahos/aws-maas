@@ -229,51 +229,41 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                     continue
                 normalized_ifaces.append(iface_obj)
 
+            # Fetch interfaces using direct node API endpoint
             interfaces = []
             ansible_host = machine.get("fqdn") or None
+            system_id = machine.get("system_id")
 
-            for iface in (normalized_ifaces or []):
-                mac = iface.get("mac_address") or iface.get("mac") or iface.get("macaddr")
-                name = iface.get("name") or iface.get("device") or iface.get("iface")
-                ips = []
+            if system_id:
+                try:
+                    # Direct API call for interfaces - more efficient
+                    iface_list = client.get(f"/api/2.0/nodes/{system_id}/interfaces/").json
 
-                # MAAS may expose ip entries under several keys and as dicts or resource URIs
-                ip_entries = (
-                    iface.get("ip_addresses")
-                    or iface.get("ips")
-                    or iface.get("ip_address")
-                    or iface.get("ipv4_addresses")
-                    or iface.get("ipv6_addresses")
-                    or []
-                )
+                    for iface in iface_list:
+                        interface_data = {
+                            "name": iface.get("name"),
+                            "mac": iface.get("mac_address"),  # MAC address is directly available
+                            "ips": []
+                        }
 
-                for ip in (ip_entries or []):
-                    ip_addr = None
-                    if isinstance(ip, str):
-                        # resource URI -> fetch
-                        try:
-                            ip_obj = client.get(ip).json
-                        except Exception:
-                            ip_obj = None
-                        if isinstance(ip_obj, dict):
-                            ip_addr = ip_obj.get("address") or ip_obj.get("ip") or ip_obj.get("cidr")
-                    elif isinstance(ip, dict):
-                        # inline object
-                        ip_addr = ip.get("address") or ip.get("ip") or ip.get("cidr")
-                    else:
-                        # fallback to string representation
-                        ip_addr = str(ip)
+                        # Get IPs from links - this is where MAAS stores actual IP assignments
+                        for link in iface.get("links", []):
+                            if link.get("mode") in ("static", "auto", "dhcp"):
+                                ip_address = link.get("ip_address")
+                                if ip_address:
+                                    interface_data["ips"].append(ip_address)
+                                    # Use first non-loopback IP as ansible_host if FQDN not available
+                                    if not ansible_host and not ip_address.startswith("127."):
+                                        ansible_host = ip_address
 
-                    if ip_addr:
-                        ips.append(ip_addr)
-                        # prefer a non-loopback address as ansible_host when fqdn missing
-                        if not ansible_host and not ip_addr.startswith("127."):
-                            ansible_host = ip_addr
+                        # Only append interfaces that have either MAC or IPs
+                        if interface_data["mac"] or interface_data["ips"]:
+                            interfaces.append(interface_data)
 
-                interfaces.append({"name": name, "mac": mac, "ips": ips})
+                except Exception as e:
+                    logger.error(f"Failed to fetch interfaces for node {system_id}: {str(e)}")
 
             inventory.set_variable(host_name, "ansible_host", ansible_host or host_name)
-            inventory.set_variable(host_name, "ansible_group", group_name)
             inventory.set_variable(host_name, "interfaces", interfaces)
 
         # --- NODES / DEVICES ---
