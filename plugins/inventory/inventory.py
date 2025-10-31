@@ -280,22 +280,12 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             if status_cfg and status_cfg.lower() != machine_status:
                 continue
 
-            # domain/group name (domain can be dict or string)
-            domain_name = None
-            if machine.get("domain"):
-                if isinstance(machine["domain"], dict):
-                    domain_name = machine["domain"].get("name")
-                elif isinstance(machine["domain"], str):
-                    domain_name = machine["domain"]
-            group_name = domain_name or "ungrouped"
-            inventory.add_group(group_name)
-
             # host identifier
             host_name = machine.get("fqdn") or machine.get("hostname") or machine.get("system_id")
             if not host_name:
                 continue
 
-            inventory.add_host(host_name, group=group_name)
+            # Add to machines group only
             inventory.add_host(host_name, group="machines")
 
             # Get interfaces from cache
@@ -364,14 +354,6 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                         node_interfaces_cache[system_id] = ([], None)
 
         for node in (node_list or []):
-            # domain for node (can be dict or string)
-            domain_name = None
-            if node.get("domain"):
-                if isinstance(node["domain"], dict):
-                    domain_name = node["domain"].get("name")
-                elif isinstance(node["domain"], str):
-                    domain_name = node["domain"]
-
             fqdn = node.get("fqdn")
             hostname = node.get("hostname")
             system_id = node.get("system_id")
@@ -379,20 +361,15 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             if fqdn:
                 node_name = fqdn
             elif hostname:
-                node_name = "{}.{}".format(hostname, domain_name) if domain_name else hostname
+                node_name = hostname
             else:
                 node_name = system_id
 
             if not node_name:
                 continue
 
-            # groups: domain (if any) and top-level devices
+            # Add to devices group only
             inventory.add_host(node_name, group="devices")
-            if domain_name:
-                inventory.add_group(domain_name)
-                inventory.add_host(node_name, group=domain_name)
-
-            inventory.set_variable(node_name, "ansible_group", domain_name or "devices")
 
             # Get interfaces from cache
             ansible_host = node.get("fqdn") or None
