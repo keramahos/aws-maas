@@ -168,6 +168,9 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
         machine_list = client.get("/api/2.0/machines/").json
 
+        # top-level machines group
+        inventory.add_group("machines")
+
         # Process machines (VMs)
         for machine in (machine_list or []):
             status_cfg = cfg.get("status")
@@ -186,7 +189,9 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             if not host_name:
                 # skip items without usable name
                 continue
+            # add to domain group and top-level machines group
             inventory.add_host(host_name, group=group_name)
+            inventory.add_host(host_name, group="machines")
 
             # gather interfaces (try resource_uri then inline)
             interfaces = []
@@ -194,25 +199,56 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             try:
                 res_uri = machine.get("resource_uri")
                 if res_uri:
-                    iface_list = client.get(res_uri.rstrip("/") + "/interfaces/").json
+                    iface_resp = client.get(res_uri.rstrip("/") + "/interfaces/").json
+                    # MAAS may return a dict with 'objects' or a plain list
+                    if isinstance(iface_resp, dict) and "objects" in iface_resp:
+                        iface_list = iface_resp.get("objects", [])
+                    else:
+                        iface_list = iface_resp
                 else:
                     iface_list = machine.get("interfaces", [])
             except Exception:
                 iface_list = machine.get("interfaces", [])
 
+            # normalize: fetch interface resources if entries are URIs
+            normalized_ifaces = []
             for iface in (iface_list or []):
+                if isinstance(iface, str):
+                    try:
+                        iface = client.get(iface).json
+                    except Exception:
+                        continue
+                normalized_ifaces.append(iface)
+
+            for iface in (normalized_ifaces or []):
                 mac = iface.get("mac_address") or iface.get("mac") or iface.get("macaddr")
                 name = iface.get("name") or iface.get("device") or iface.get("iface")
                 ips = []
-                for ip in iface.get("ip_addresses", []) or iface.get("ips", []) or []:
-                    if isinstance(ip, dict):
-                        ip_addr = ip.get("address") or ip.get("ip")
+
+                # MAAS may expose ip entries as dicts or URIs; handle both
+                ip_entries = iface.get("ip_addresses") or iface.get("ips") or iface.get("ip_address") or []
+                for ip in (ip_entries or []):
+                    ip_addr = None
+                    if isinstance(ip, str):
+                        # ip is a resource URI -> fetch it
+                        try:
+                            ip_obj = client.get(ip).json
+                        except Exception:
+                            ip_obj = None
+                        if isinstance(ip_obj, dict):
+                            ip_addr = ip_obj.get("address") or ip_obj.get("ip") or ip_obj.get("cidr")
+                    elif isinstance(ip, dict):
+                        ip_addr = ip.get("address") or ip.get("ip") or ip.get("cidr")
                     else:
-                        ip_addr = ip
+                        # fallback to string conversion
+                        ip_addr = str(ip)
+
                     if ip_addr:
                         ips.append(ip_addr)
-                        if not ansible_host:
+                        # prefer a non-loopback ip for ansible_host if fqdn missing
+                        if not ansible_host and not ip_addr.startswith("127."):
                             ansible_host = ip_addr
+
                 interfaces.append({"name": name, "mac": mac, "ips": ips})
 
             inventory.set_variable(host_name, "ansible_host", ansible_host or host_name)
@@ -225,39 +261,88 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         except Exception:
             node_list = []
 
+        # ensure top-level devices group exists
+        inventory.add_group("devices")
+
         for node in (node_list or []):
-            node_name = node.get("hostname") or node.get("fqdn") or node.get("system_id")
+            # build node name: prefer fqdn, otherwise hostname + domain (if available), otherwise system_id
+            fqdn = node.get("fqdn")
+            hostname = node.get("hostname")
+            system_id = node.get("system_id")
+            domain_name = None
+            if node.get("domain"):
+                if isinstance(node["domain"], dict):
+                    domain_name = node["domain"].get("name")
+                elif isinstance(node["domain"], str):
+                    domain_name = node["domain"]
+
+            if fqdn:
+                node_name = fqdn
+            elif hostname:
+                node_name = "{}.{}".format(hostname, domain_name) if domain_name else hostname
+            else:
+                node_name = system_id
+
             if not node_name:
                 continue
 
-            inventory.add_group("devices")
+            # add to domain group (if available) and top-level devices group
             inventory.add_host(node_name, group="devices")
-            inventory.set_variable(node_name, "ansible_group", "devices")
+            if domain_name:
+                inventory.add_group(domain_name)
+                inventory.add_host(node_name, group=domain_name)
+
+            inventory.set_variable(node_name, "ansible_group", domain_name or "devices")
 
             interfaces = []
             ansible_host = node.get("fqdn") or None
             try:
                 res_uri = node.get("resource_uri")
                 if res_uri:
-                    iface_list = client.get(res_uri.rstrip("/") + "/interfaces/").json
+                    iface_resp = client.get(res_uri.rstrip("/") + "/interfaces/").json
+                    if isinstance(iface_resp, dict) and "objects" in iface_resp:
+                        iface_list = iface_resp.get("objects", [])
+                    else:
+                        iface_list = iface_resp
                 else:
                     iface_list = node.get("interfaces", [])
             except Exception:
                 iface_list = node.get("interfaces", [])
 
+            normalized_ifaces = []
             for iface in (iface_list or []):
+                if isinstance(iface, str):
+                    try:
+                        iface = client.get(iface).json
+                    except Exception:
+                        continue
+                normalized_ifaces.append(iface)
+
+            for iface in (normalized_ifaces or []):
                 mac = iface.get("mac_address") or iface.get("mac") or iface.get("macaddr")
                 name = iface.get("name") or iface.get("device") or iface.get("iface")
                 ips = []
-                for ip in iface.get("ip_addresses", []) or iface.get("ips", []) or []:
-                    if isinstance(ip, dict):
-                        ip_addr = ip.get("address") or ip.get("ip")
+
+                ip_entries = iface.get("ip_addresses") or iface.get("ips") or iface.get("ip_address") or []
+                for ip in (ip_entries or []):
+                    ip_addr = None
+                    if isinstance(ip, str):
+                        try:
+                            ip_obj = client.get(ip).json
+                        except Exception:
+                            ip_obj = None
+                        if isinstance(ip_obj, dict):
+                            ip_addr = ip_obj.get("address") or ip_obj.get("ip") or ip_obj.get("cidr")
+                    elif isinstance(ip, dict):
+                        ip_addr = ip.get("address") or ip.get("ip") or ip.get("cidr")
                     else:
-                        ip_addr = ip
+                        ip_addr = str(ip)
+
                     if ip_addr:
                         ips.append(ip_addr)
-                        if not ansible_host:
+                        if not ansible_host and not ip_addr.startswith("127."):
                             ansible_host = ip_addr
+
                 interfaces.append({"name": name, "mac": mac, "ips": ips})
 
             inventory.set_variable(node_name, "ansible_host", ansible_host or node_name)
