@@ -104,6 +104,7 @@ status: ready
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ansible.plugins.inventory import (
     BaseInventoryPlugin,
@@ -121,6 +122,77 @@ logger = logging.getLogger(__name__)
 
 class LdapBaseException(Exception):
     pass
+
+
+def fetch_node_interfaces(client, system_id):
+    """
+    Fetch interface data for a node/machine using MAAS API.
+    Returns a tuple of (interfaces_list, ansible_host).
+    """
+    interfaces = []
+    ansible_host = None
+
+    try:
+        # Get detailed interface information using proper API endpoint
+        iface_response = client.get(f"/api/2.0/nodes/{system_id}/interfaces/").json
+
+        # Handle both list and dict responses
+        if isinstance(iface_response, list):
+            iface_data = iface_response
+        elif isinstance(iface_response, dict) and "objects" in iface_response:
+            iface_data = iface_response.get("objects", [])
+        else:
+            iface_data = []
+
+        for iface in iface_data:
+            interface_data = {
+                "name": iface.get("name"),
+                "mac": iface.get("mac_address"),
+                "ips": [],
+                "type": iface.get("type"),
+                "enabled": iface.get("enabled")
+            }
+
+            # Get IP addresses from links (static, DHCP, AUTO)
+            links = iface.get("links", [])
+            for link in links:
+                ip_address = link.get("ip_address")
+                if ip_address:
+                    interface_data["ips"].append(ip_address)
+                    # Store subnet info if available
+                    subnet = link.get("subnet", {})
+                    if subnet and isinstance(subnet, dict):
+                        cidr = subnet.get("cidr")
+                        if cidr and "subnet" not in interface_data:
+                            interface_data["subnet"] = cidr
+
+            # Also check for discovered IPs
+            discovered = iface.get("discovered")
+            if discovered and isinstance(discovered, list):
+                for disc in discovered:
+                    if isinstance(disc, dict):
+                        subnet = disc.get("subnet")
+                        if subnet and isinstance(subnet, dict):
+                            ip = subnet.get("cidr")
+                            if ip and ip not in interface_data["ips"]:
+                                interface_data["ips"].append(ip)
+
+            # Set first usable IP as ansible_host if not set
+            if interface_data["ips"] and not ansible_host:
+                for ip in interface_data["ips"]:
+                    # Skip loopback and link-local addresses
+                    if not ip.startswith(("127.", "169.254.", "fe80:")):
+                        ansible_host = ip
+                        break
+
+            # Only include interfaces with either MAC or IPs
+            if interface_data["mac"] or interface_data["ips"]:
+                interfaces.append(interface_data)
+
+    except Exception as e:
+        logger.error(f"Failed to fetch interfaces for node {system_id}: {str(e)}")
+
+    return interfaces, ansible_host
 
 
 class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
@@ -175,6 +247,32 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
         inventory.add_group("machines")
 
+        # Pre-fetch all interface data in parallel for better performance
+        machine_interfaces_cache = {}
+        machine_system_ids = []
+
+        for machine in (machine_list or []):
+            system_id = machine.get("system_id")
+            if system_id:
+                machine_system_ids.append(system_id)
+
+        # Fetch interfaces in parallel using ThreadPoolExecutor
+        if machine_system_ids:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_system_id = {
+                    executor.submit(fetch_node_interfaces, client, system_id): system_id
+                    for system_id in machine_system_ids
+                }
+                for future in as_completed(future_to_system_id):
+                    system_id = future_to_system_id[future]
+                    try:
+                        interfaces, ansible_host = future.result()
+                        machine_interfaces_cache[system_id] = (interfaces, ansible_host)
+                    except Exception as e:
+                        logger.error(f"Failed to fetch interfaces for {system_id}: {str(e)}")
+                        machine_interfaces_cache[system_id] = ([], None)
+
+        # Now process machines with cached interface data
         for machine in (machine_list or []):
             # status filtering
             status_cfg = cfg.get("status")
@@ -200,81 +298,33 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             inventory.add_host(host_name, group=group_name)
             inventory.add_host(host_name, group="machines")
 
-            # fetch interfaces: prefer machine resource interfaces endpoint, fallback to inline
-            iface_list = []
-            try:
-                res_uri = machine.get("resource_uri")
-                if res_uri:
-                    resp = client.get(res_uri.rstrip("/") + "/interfaces/").json
-                    if isinstance(resp, dict) and "objects" in resp:
-                        iface_list = resp.get("objects") or []
-                    else:
-                        iface_list = resp or []
-                else:
-                    iface_list = machine.get("interfaces") or []
-            except Exception:
-                iface_list = machine.get("interfaces") or []
-
-            # normalize interfaces (follow URIs if present)
-            normalized_ifaces = []
-            for iface in (iface_list or []):
-                if isinstance(iface, str):
-                    try:
-                        iface_obj = client.get(iface).json
-                    except Exception:
-                        continue
-                else:
-                    iface_obj = iface
-                if not isinstance(iface_obj, dict):
-                    continue
-                normalized_ifaces.append(iface_obj)
-
-            # Fetch interfaces and network data directly using MAAS API
-            interfaces = []
-            ansible_host = machine.get("fqdn") or None
+            # Get interfaces from cache
             system_id = machine.get("system_id")
+            ansible_host = machine.get("fqdn") or None
+            interfaces = []
 
-            if system_id:
+            if system_id and system_id in machine_interfaces_cache:
+                interfaces, fetched_host = machine_interfaces_cache[system_id]
+                # Use fetched IP if FQDN not available
+                if not ansible_host and fetched_host:
+                    ansible_host = fetched_host
+
+            # Fallback to inline interface data if cache is empty
+            if not interfaces and system_id:
                 try:
-                    # Get all network interfaces for this machine
-                    iface_list = client.get(f"/api/2.0/machines/{system_id}/interfaces/").json
-
-                    for iface in iface_list:
-                        interface_data = {
-                            "name": iface.get("name"),
-                            "mac": iface.get("mac_address"),
-                            "ips": []
-                        }
-
-                        # Get IP addresses from both links and discovered IPs
-                        if iface.get("links"):
-                            for link in iface.get("links", []):
-                                # Static and DHCP addresses
-                                if link.get("ip_address"):
-                                    interface_data["ips"].append(link["ip_address"])
-                                # Subnet details if available
-                                if link.get("subnet", {}).get("cidr"):
-                                    interface_data["subnet"] = link["subnet"]["cidr"]
-
-                        # Include discovered IPs if any
-                        if iface.get("discovered", {}).get("ip_addresses"):
-                            for ip in iface["discovered"]["ip_addresses"]:
-                                if ip not in interface_data["ips"]:
-                                    interface_data["ips"].append(ip)
-
-                        # Set first usable IP as ansible_host if FQDN not available
-                        if interface_data["ips"] and not ansible_host:
-                            for ip in interface_data["ips"]:
-                                if not ip.startswith("127."):
-                                    ansible_host = ip
-                                    break
-
-                        # Only include interfaces with either MAC or IPs
-                        if interface_data["mac"] or interface_data["ips"]:
-                            interfaces.append(interface_data)
-
-                except Exception as e:
-                    logger.error(f"Failed to fetch interfaces for machine {system_id}: {str(e)}")
+                    inline_ifaces = machine.get("interface_set", []) or machine.get("interfaces", [])
+                    for iface in inline_ifaces:
+                        if isinstance(iface, dict):
+                            mac = iface.get("mac_address")
+                            name = iface.get("name")
+                            if mac or name:
+                                interfaces.append({
+                                    "name": name,
+                                    "mac": mac,
+                                    "ips": []
+                                })
+                except Exception:
+                    pass
 
             inventory.set_variable(host_name, "ansible_host", ansible_host or host_name)
             inventory.set_variable(host_name, "interfaces", interfaces)
@@ -287,6 +337,31 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
         # top-level devices group
         inventory.add_group("devices")
+
+        # Pre-fetch all node interface data in parallel for better performance
+        node_interfaces_cache = {}
+        node_system_ids = []
+
+        for node in (node_list or []):
+            system_id = node.get("system_id")
+            if system_id:
+                node_system_ids.append(system_id)
+
+        # Fetch interfaces in parallel using ThreadPoolExecutor
+        if node_system_ids:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_system_id = {
+                    executor.submit(fetch_node_interfaces, client, system_id): system_id
+                    for system_id in node_system_ids
+                }
+                for future in as_completed(future_to_system_id):
+                    system_id = future_to_system_id[future]
+                    try:
+                        interfaces, ansible_host = future.result()
+                        node_interfaces_cache[system_id] = (interfaces, ansible_host)
+                    except Exception as e:
+                        logger.error(f"Failed to fetch interfaces for {system_id}: {str(e)}")
+                        node_interfaces_cache[system_id] = ([], None)
 
         for node in (node_list or []):
             # domain for node (can be dict or string)
@@ -319,71 +394,32 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
             inventory.set_variable(node_name, "ansible_group", domain_name or "devices")
 
-            # fetch node interfaces (same logic as machines)
-            iface_list = []
-            try:
-                res_uri = node.get("resource_uri")
-                if res_uri:
-                    resp = client.get(res_uri.rstrip("/") + "/interfaces/").json
-                    if isinstance(resp, dict) and "objects" in resp:
-                        iface_list = resp.get("objects") or []
-                    else:
-                        iface_list = resp or []
-                else:
-                    iface_list = node.get("interfaces") or []
-            except Exception:
-                iface_list = node.get("interfaces") or []
-
-            normalized_ifaces = []
-            for iface in (iface_list or []):
-                if isinstance(iface, str):
-                    try:
-                        iface_obj = client.get(iface).json
-                    except Exception:
-                        continue
-                else:
-                    iface_obj = iface
-                if not isinstance(iface_obj, dict):
-                    continue
-                normalized_ifaces.append(iface_obj)
-
-            interfaces = []
+            # Get interfaces from cache
             ansible_host = node.get("fqdn") or None
+            interfaces = []
 
-            for iface in (normalized_ifaces or []):
-                mac = iface.get("mac_address") or iface.get("mac") or iface.get("macaddr")
-                name = iface.get("name") or iface.get("device") or iface.get("iface")
-                ips = []
+            if system_id and system_id in node_interfaces_cache:
+                interfaces, fetched_host = node_interfaces_cache[system_id]
+                # Use fetched IP if FQDN not available
+                if not ansible_host and fetched_host:
+                    ansible_host = fetched_host
 
-                ip_entries = (
-                    iface.get("ip_addresses")
-                    or iface.get("ips")
-                    or iface.get("ip_address")
-                    or iface.get("ipv4_addresses")
-                    or iface.get("ipv6_addresses")
-                    or []
-                )
-
-                for ip in (ip_entries or []):
-                    ip_addr = None
-                    if isinstance(ip, str):
-                        try:
-                            ip_obj = client.get(ip).json
-                        except Exception:
-                            ip_obj = None
-                        if isinstance(ip_obj, dict):
-                            ip_addr = ip_obj.get("address") or ip_obj.get("ip") or ip_obj.get("cidr")
-                    elif isinstance(ip, dict):
-                        ip_addr = ip.get("address") or ip.get("ip") or ip.get("cidr")
-                    else:
-                        ip_addr = str(ip)
-
-                    if ip_addr:
-                        ips.append(ip_addr)
-                        if not ansible_host and not ip_addr.startswith("127."):
-                            ansible_host = ip_addr
-
-                interfaces.append({"name": name, "mac": mac, "ips": ips})
+            # Fallback to inline interface data if cache is empty
+            if not interfaces and system_id:
+                try:
+                    inline_ifaces = node.get("interface_set", []) or node.get("interfaces", [])
+                    for iface in inline_ifaces:
+                        if isinstance(iface, dict):
+                            mac = iface.get("mac_address")
+                            name = iface.get("name")
+                            if mac or name:
+                                interfaces.append({
+                                    "name": name,
+                                    "mac": mac,
+                                    "ips": []
+                                })
+                except Exception:
+                    pass
 
             inventory.set_variable(node_name, "ansible_host", ansible_host or node_name)
             inventory.set_variable(node_name, "interfaces", interfaces)
