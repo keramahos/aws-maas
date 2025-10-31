@@ -229,39 +229,52 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                     continue
                 normalized_ifaces.append(iface_obj)
 
-            # Fetch interfaces using direct node API endpoint
+            # Fetch interfaces and network data directly using MAAS API
             interfaces = []
             ansible_host = machine.get("fqdn") or None
             system_id = machine.get("system_id")
 
             if system_id:
                 try:
-                    # Direct API call for interfaces - more efficient
-                    iface_list = client.get(f"/api/2.0/nodes/{system_id}/interfaces/").json
+                    # Get all network interfaces for this machine
+                    iface_list = client.get(f"/api/2.0/machines/{system_id}/interfaces/").json
 
                     for iface in iface_list:
                         interface_data = {
                             "name": iface.get("name"),
-                            "mac": iface.get("mac_address"),  # MAC address is directly available
+                            "mac": iface.get("mac_address"),
                             "ips": []
                         }
 
-                        # Get IPs from links - this is where MAAS stores actual IP assignments
-                        for link in iface.get("links", []):
-                            if link.get("mode") in ("static", "auto", "dhcp"):
-                                ip_address = link.get("ip_address")
-                                if ip_address:
-                                    interface_data["ips"].append(ip_address)
-                                    # Use first non-loopback IP as ansible_host if FQDN not available
-                                    if not ansible_host and not ip_address.startswith("127."):
-                                        ansible_host = ip_address
+                        # Get IP addresses from both links and discovered IPs
+                        if iface.get("links"):
+                            for link in iface.get("links", []):
+                                # Static and DHCP addresses
+                                if link.get("ip_address"):
+                                    interface_data["ips"].append(link["ip_address"])
+                                # Subnet details if available
+                                if link.get("subnet", {}).get("cidr"):
+                                    interface_data["subnet"] = link["subnet"]["cidr"]
 
-                        # Only append interfaces that have either MAC or IPs
+                        # Include discovered IPs if any
+                        if iface.get("discovered", {}).get("ip_addresses"):
+                            for ip in iface["discovered"]["ip_addresses"]:
+                                if ip not in interface_data["ips"]:
+                                    interface_data["ips"].append(ip)
+
+                        # Set first usable IP as ansible_host if FQDN not available
+                        if interface_data["ips"] and not ansible_host:
+                            for ip in interface_data["ips"]:
+                                if not ip.startswith("127."):
+                                    ansible_host = ip
+                                    break
+
+                        # Only include interfaces with either MAC or IPs
                         if interface_data["mac"] or interface_data["ips"]:
                             interfaces.append(interface_data)
 
                 except Exception as e:
-                    logger.error(f"Failed to fetch interfaces for node {system_id}: {str(e)}")
+                    logger.error(f"Failed to fetch interfaces for machine {system_id}: {str(e)}")
 
             inventory.set_variable(host_name, "ansible_host", ansible_host or host_name)
             inventory.set_variable(host_name, "interfaces", interfaces)
