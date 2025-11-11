@@ -319,6 +319,36 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             inventory.set_variable(host_name, "ansible_host", ansible_host or host_name)
             inventory.set_variable(host_name, "interfaces", interfaces)
 
+            # Extract and store MAAS tags as host variable
+            tags = machine.get("tag_names", []) or machine.get("tags", [])
+            if tags:
+                inventory.set_variable(host_name, "maas_tags", tags)
+                # Also create groups for each tag and add host to those groups
+                for tag in tags:
+                    if tag:  # skip empty tags
+                        tag_group = f"tag_{tag}"
+                        inventory.add_group(tag_group)
+                        inventory.add_host(host_name, group=tag_group)
+
+            # Store additional MAAS metadata as facts
+            maas_facts = {
+                "system_id": machine.get("system_id"),
+                "status": machine.get("status_name"),
+                "architecture": machine.get("architecture"),
+                "cpu_count": machine.get("cpu_count"),
+                "memory": machine.get("memory"),
+                "storage": machine.get("storage"),
+                "distro_series": machine.get("distro_series"),
+                "osystem": machine.get("osystem"),
+                "power_type": machine.get("power_type"),
+                "zone": machine.get("zone", {}).get("name") if isinstance(machine.get("zone"), dict) else machine.get("zone"),
+                "pool": machine.get("pool", {}).get("name") if isinstance(machine.get("pool"), dict) else machine.get("pool"),
+            }
+            # Only store non-None values
+            maas_facts = {k: v for k, v in maas_facts.items() if v is not None}
+            if maas_facts:
+                inventory.set_variable(host_name, "maas_facts", maas_facts)
+
         # --- NODES / DEVICES ---
         try:
             node_list = client.get("/api/2.0/nodes/").json or []
@@ -400,3 +430,31 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
             inventory.set_variable(node_name, "ansible_host", ansible_host or node_name)
             inventory.set_variable(node_name, "interfaces", interfaces)
+
+            # Extract and store MAAS tags as host variable
+            tags = node.get("tag_names", []) or node.get("tags", [])
+            if tags:
+                inventory.set_variable(node_name, "maas_tags", tags)
+                # Also create groups for each tag and add host to those groups
+                for tag in tags:
+                    if tag:  # skip empty tags
+                        tag_group = f"tag_{tag}"
+                        inventory.add_group(tag_group)
+                        inventory.add_host(node_name, group=tag_group)
+
+            # Store additional MAAS metadata as facts
+            maas_facts = {
+                "system_id": node.get("system_id"),
+                "node_type": node.get("node_type_name"),
+                "architecture": node.get("architecture"),
+                "cpu_count": node.get("cpu_count"),
+                "memory": node.get("memory"),
+                "storage": node.get("storage"),
+                "power_type": node.get("power_type"),
+                "zone": node.get("zone", {}).get("name") if isinstance(node.get("zone"), dict) else node.get("zone"),
+                "pool": node.get("pool", {}).get("name") if isinstance(node.get("pool"), dict) else node.get("pool"),
+            }
+            # Only store non-None values
+            maas_facts = {k: v for k, v in maas_facts.items() if v is not None}
+            if maas_facts:
+                inventory.set_variable(node_name, "maas_facts", maas_facts)
