@@ -116,7 +116,7 @@ import yaml
 from ..module_utils import errors
 from ..module_utils.client import Client
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +273,13 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                         machine_interfaces_cache[system_id] = ([], None)
 
         # Now process machines with cached interface data
+        # Debug: output first machine to see structure
+        if machine_list and len(machine_list) > 0:
+            import json
+            logger.debug("=== SAMPLE MACHINE OBJECT ===")
+            logger.debug(json.dumps(machine_list[0], indent=2, default=str))
+            logger.debug("=== END SAMPLE ===")
+
         for machine in (machine_list or []):
             # status filtering
             status_cfg = cfg.get("status")
@@ -320,8 +327,15 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             inventory.set_variable(host_name, "interfaces", interfaces)
 
             # Extract and store MAAS tags as host variable
-            tags = machine.get("tag_names", []) or machine.get("tags", [])
-            if tags:
+            # Try multiple possible field names for tags
+            tags = machine.get("tag_names", []) or machine.get("tags", []) or []
+
+            # Debug logging to see what's in the machine object
+            logger.debug(f"Machine {host_name} tag_names: {machine.get('tag_names')}")
+            logger.debug(f"Machine {host_name} tags: {machine.get('tags')}")
+            logger.debug(f"Machine {host_name} keys: {list(machine.keys())}")
+
+            if tags and isinstance(tags, list):
                 inventory.set_variable(host_name, "maas_tags", tags)
                 # Also create groups for each tag and add host to those groups
                 for tag in tags:
@@ -383,6 +397,13 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                         logger.error(f"Failed to fetch interfaces for {system_id}: {str(e)}")
                         node_interfaces_cache[system_id] = ([], None)
 
+        # Debug: output first node to see structure
+        if node_list and len(node_list) > 0:
+            import json
+            logger.debug("=== SAMPLE NODE OBJECT ===")
+            logger.debug(json.dumps(node_list[0], indent=2, default=str))
+            logger.debug("=== END SAMPLE ===")
+
         for node in (node_list or []):
             fqdn = node.get("fqdn")
             hostname = node.get("hostname")
@@ -432,8 +453,15 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             inventory.set_variable(node_name, "interfaces", interfaces)
 
             # Extract and store MAAS tags as host variable
-            tags = node.get("tag_names", []) or node.get("tags", [])
-            if tags:
+            # Try multiple possible field names for tags
+            tags = node.get("tag_names", []) or node.get("tags", []) or []
+
+            # Debug logging to see what's in the node object
+            logger.debug(f"Node {node_name} tag_names: {node.get('tag_names')}")
+            logger.debug(f"Node {node_name} tags: {node.get('tags')}")
+            logger.debug(f"Node {node_name} keys: {list(node.keys())}")
+
+            if tags and isinstance(tags, list):
                 inventory.set_variable(node_name, "maas_tags", tags)
                 # Also create groups for each tag and add host to those groups
                 for tag in tags:
